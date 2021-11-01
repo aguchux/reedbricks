@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.9;
 
-import 'IUniswapV2Router01.sol';
+import 'interfaces/IUniswapV2Router01.sol';
 
 // IUniswapV2Router02
 interface IUniswapV2Router02 is IUniswapV2Router01 {

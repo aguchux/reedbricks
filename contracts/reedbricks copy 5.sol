@@ -406,6 +406,69 @@ contract Ownable is Context {
     }
 }
 
+
+library IterableMapping {
+   
+    struct Map {
+        address[] keys;
+        mapping(address => uint) values;
+        mapping(address => uint) indexOf;
+        mapping(address => bool) inserted;
+    }
+
+    function get(Map storage map, address key) public view returns (uint) {
+        return map.values[key];
+    }
+
+    function getIndexOfKey(Map storage map, address key) public view returns (int) {
+        if(!map.inserted[key]) {
+            return -1;
+        }
+        return int(map.indexOf[key]);
+    }
+
+    function getKeyAtIndex(Map storage map, uint index) public view returns (address) {
+        return map.keys[index];
+    }
+
+    function size(Map storage map) public view returns (uint) {
+        return map.keys.length;
+    }
+
+    function set(Map storage map, address key, uint val) public {
+        if (map.inserted[key]) {
+            map.values[key] = val;
+        } else {
+            map.inserted[key] = true;
+            map.values[key] = val;
+            map.indexOf[key] = map.keys.length;
+            map.keys.push(key);
+        }
+    }
+
+    function remove(Map storage map, address key) public {
+        if (!map.inserted[key]) {
+            return;
+        }
+
+        delete map.inserted[key];
+        delete map.values[key];
+
+        uint index = map.indexOf[key];
+        uint lastIndex = map.keys.length - 1;
+        address lastKey = map.keys[lastIndex];
+
+        map.indexOf[lastKey] = index;
+        delete map.indexOf[key];
+
+        map.keys[index] = lastKey;
+        map.keys.pop();
+    }
+
+    
+}
+
+
 interface IUniswapV2Factory {
     event PairCreated(address indexed token0, address indexed token1, address pair, uint);
 
@@ -629,7 +692,7 @@ interface IERC20Metadata is IERC20 {
     function decimals() external view returns (uint8);
 }
 
-contract ERC20 is Context, IERC20, IERC20Metadata {
+contract ERC20 is Context, IERC20Metadata {
     using SafeMath for uint256;
 
     mapping(address => uint256) private _balances;
@@ -745,36 +808,338 @@ contract ERC20 is Context, IERC20, IERC20Metadata {
     ) internal virtual {}
 }
 
-contract Utilities {
+interface DividendPayingTokenInterface {
+  function dividendOf(address _owner) external view returns(uint256);
+  function distributeDividends() external payable;
+  function withdrawDividend() external;
+  event DividendsDistributed(
+    address indexed from,
+    uint256 weiAmount
+  );
+ event DividendWithdrawn(
+    address indexed to,
+    uint256 weiAmount
+  );
+}
 
+interface DividendPayingTokenOptionalInterface {
+  function withdrawableDividendOf(address _owner) external view returns(uint256);
+  function withdrawnDividendOf(address _owner) external view returns(uint256);
+  function accumulativeDividendOf(address _owner) external view returns(uint256);
+}
 
-    //This is where all your gas goes, sorry
-    //Not sorry, you probably only paid 1 gwei
-    function sqrt(uint x) internal pure returns (uint y) {
-        uint z = (x + 1) / 2;
-        y = x;
-        while (z < y) {
-            y = z;
-            z = (x / z + z) / 2;
-        }
+/// @title Dividend-Paying Token
+/// @author Roger Wu (https://github.com/roger-wu)
+/// @dev A mintable ERC20 token that allows anyone to pay and distribute ether
+///  to token holders as dividends and allows token holders to withdraw their dividends.
+///  Reference: the source code of PoWH3D: https://etherscan.io/address/0xB3775fB83F7D12A36E0475aBdD1FCA35c091efBe#code
+contract DividendPayingToken is ERC20, DividendPayingTokenInterface, DividendPayingTokenOptionalInterface {
+  using SafeMath for uint256;
+  using SafeMathUint for uint256;
+  using SafeMathInt for int256;
+
+  // With `magnitude`, we can properly distribute dividends even if the amount of received ether is small.
+  // For more discussion about choosing the value of `magnitude`,
+  //  see https://github.com/ethereum/EIPs/issues/1726#issuecomment-472352728
+  uint256 constant internal magnitude = 2**128;
+  uint256 internal magnifiedDividendPerShare;
+  uint256 public totalDividendsDistributed;
+
+  // About dividendCorrection:
+  // If the token balance of a `_user` is never changed, the dividend of `_user` can be computed with:
+  //   `dividendOf(_user) = dividendPerShare * balanceOf(_user)`.
+  // When `balanceOf(_user)` is changed (via minting/burning/transferring tokens),
+  //   `dividendOf(_user)` should not be changed,
+  //   but the computed value of `dividendPerShare * balanceOf(_user)` is changed.
+  // To keep the `dividendOf(_user)` unchanged, we add a correction term:
+  //   `dividendOf(_user) = dividendPerShare * balanceOf(_user) + dividendCorrectionOf(_user)`,
+  //   where `dividendCorrectionOf(_user)` is updated whenever `balanceOf(_user)` is changed:
+  //   `dividendCorrectionOf(_user) = dividendPerShare * (old balanceOf(_user)) - (new balanceOf(_user))`.
+  // So now `dividendOf(_user)` returns the same value before and after `balanceOf(_user)` is changed.
+  mapping(address => int256) internal magnifiedDividendCorrections;
+  mapping(address => uint256) internal withdrawnDividends;
+
+  constructor(string memory _name, string memory _symbol) ERC20(_name, _symbol) {}
+
+  /// @dev Distributes dividends whenever ether is paid to this contract.
+  receive() external payable {
+    distributeDividends();
+  }
+
+  /// @notice Distributes ether to token holders as dividends.
+  /// @dev It reverts if the total supply of tokens is 0.
+  /// It emits the `DividendsDistributed` event if the amount of received ether is greater than 0.
+  /// About undistributed ether:
+  ///   In each distribution, there is a small amount of ether not distributed,
+  ///     the magnified amount of which is
+  ///     `(msg.value * magnitude) % totalSupply()`.
+  ///   With a well-chosen `magnitude`, the amount of undistributed ether
+  ///     (de-magnified) in a distribution can be less than 1 wei.
+  ///   We can actually keep track of the undistributed ether in a distribution
+  ///     and try to distribute it in the next distribution,
+  ///     but keeping track of such data on-chain costs much more than
+  ///     the saved ether, so we don't do that.
+  function distributeDividends() public override payable {
+    require(totalSupply() > 0);
+    if (msg.value > 0) {
+      magnifiedDividendPerShare = magnifiedDividendPerShare.add((msg.value).mul(magnitude) / totalSupply());
+      emit DividendsDistributed(msg.sender, msg.value);
+      totalDividendsDistributed = totalDividendsDistributed.add(msg.value);
     }
+  }
+  function withdrawDividend() public virtual override {
+    _withdrawDividendOfUser(payable(msg.sender));
+  }
+  function _withdrawDividendOfUser(address payable user) internal returns (uint256) {
+    uint256 _withdrawableDividend = withdrawableDividendOf(user);
+    if (_withdrawableDividend > 0) {
+      withdrawnDividends[user] = withdrawnDividends[user].add(_withdrawableDividend);
+      emit DividendWithdrawn(user, _withdrawableDividend);
+      (bool success,) = user.call{value: _withdrawableDividend, gas: 3000}("");
+      if(!success) {
+        withdrawnDividends[user] = withdrawnDividends[user].sub(_withdrawableDividend);
+        return 0;
+      }
+      return _withdrawableDividend;
+    }
+    return 0;
+  }
+  function dividendOf(address _owner) public view override returns(uint256) {
+    return withdrawableDividendOf(_owner);
+  }
+  function withdrawableDividendOf(address _owner) public view override returns(uint256) {
+    return accumulativeDividendOf(_owner).sub(withdrawnDividends[_owner]);
+  }
+  function withdrawnDividendOf(address _owner) public view override returns(uint256) {
+    return withdrawnDividends[_owner];
+  }
+  function accumulativeDividendOf(address _owner) public view override returns(uint256) {
+    return magnifiedDividendPerShare.mul(balanceOf(_owner)).toInt256Safe()
+      .add(magnifiedDividendCorrections[_owner]).toUint256Safe() / magnitude;
+  }
+  function _transfer(address from, address to, uint256 value) internal virtual override {
+    require(false);
+    int256 _magCorrection = magnifiedDividendPerShare.mul(value).toInt256Safe();
+    magnifiedDividendCorrections[from] = magnifiedDividendCorrections[from].add(_magCorrection);
+    magnifiedDividendCorrections[to] = magnifiedDividendCorrections[to].sub(_magCorrection);
+  }
+  function _mint(address account, uint256 value) internal override {
+    super._mint(account, value);
+    magnifiedDividendCorrections[account] = magnifiedDividendCorrections[account]
+      .sub( (magnifiedDividendPerShare.mul(value)).toInt256Safe() );
+  }
+
+  function _burn(address account, uint256 value) internal override {
+    super._burn(account, value);
+    magnifiedDividendCorrections[account] = magnifiedDividendCorrections[account]
+      .add( (magnifiedDividendPerShare.mul(value)).toInt256Safe() );
+  }
+
+  function _setBalance(address account, uint256 newBalance) internal {
+    uint256 currentBalance = balanceOf(account);
+    if(newBalance > currentBalance) {
+      uint256 mintAmount = newBalance.sub(currentBalance);
+      _mint(account, mintAmount);
+    } else if(newBalance < currentBalance) {
+      uint256 burnAmount = currentBalance.sub(newBalance);
+      _burn(account, burnAmount);
+    }
+  }
+
+  
+}
+
+
+
+contract ReedDividend is DividendPayingToken, Ownable {
+
+    using SafeMath for uint256;
+    using SafeMathInt for int256;
+
+    using IterableMapping for IterableMapping.Map;
+    IterableMapping.Map private tokenHoldersMap;
+    
+    uint256 public lastProcessedIndex;
+    
+    mapping (address => bool) public excludedFromDividends;
+    mapping (address => uint256) public lastClaimTimes;
+    uint256 public claimWait;
+    uint256 public minimumTokenBalanceForDividends;
+    
+    event ExcludeFromDividends(address indexed account);
+    event ClaimWaitUpdated(uint256 indexed newValue, uint256 indexed oldValue);
+    event Claim(address indexed account, uint256 amount, bool indexed automatic);
+
+    constructor() DividendPayingToken("REED_Dividend_Tracker", "REEDX") {
+    	claimWait = 3600;
+        minimumTokenBalanceForDividends = 5000000 * (10**18); 
+    }
+
+    function _transfer(address, address, uint256) internal override pure{
+        require(false, "REEDT: No transfers allowed");
+    }
+
+    function withdrawDividend() public override pure{
+        require(false, "REEDT: withdrawDividend disabled. Use the 'claim' function on the main REED contract.");
+    }
+    
+    function excludeFromDividends(address account) external onlyOwner {
+    	require(!excludedFromDividends[account]);
+    	excludedFromDividends[account] = true;
+    	_setBalance(account, 0);
+    	tokenHoldersMap.remove(account);
+    	emit ExcludeFromDividends(account);
+    }
+    function setTokenBalanceForDividends(uint256 newValue) external onlyOwner {
+        require(minimumTokenBalanceForDividends != newValue, "REED _Dividend_Tracker: minimumTokenBalanceForDividends already the value of 'newValue'.");
+        minimumTokenBalanceForDividends = newValue;
+    } 
+    function updateClaimWait(uint256 newClaimWait) external onlyOwner {
+        require(newClaimWait >= 3600 && newClaimWait <= 86400, "REED _Dividend_Tracker: claimWait must be updated to between 1 and 24 hours");
+        require(newClaimWait != claimWait, "REED _Dividend_Tracker: Cannot update claimWait to same value");
+        emit ClaimWaitUpdated(newClaimWait, claimWait);
+        claimWait = newClaimWait;
+    }
+    function getLastProcessedIndex() external view returns(uint256) {
+    	return lastProcessedIndex;
+    }
+    function getNumberOfTokenHolders() external view returns(uint256) {
+        return tokenHoldersMap.keys.length;
+    }
+    function getAccount(address _account)
+        public view returns (
+            address account,
+            int256 index,
+            int256 iterationsUntilProcessed,
+            uint256 withdrawableDividends,
+            uint256 totalDividends,
+            uint256 lastClaimTime,
+            uint256 nextClaimTime,
+            uint256 secondsUntilAutoClaimAvailable) {
+        account = _account;
+
+        index = tokenHoldersMap.getIndexOfKey(account);
+        iterationsUntilProcessed = -1;
+        if(index >= 0) {
+            if(uint256(index) > lastProcessedIndex) {
+                iterationsUntilProcessed = index.sub(int256(lastProcessedIndex));
+            }
+            else {
+                uint256 processesUntilEndOfArray = tokenHoldersMap.keys.length > lastProcessedIndex ? tokenHoldersMap.keys.length.sub(lastProcessedIndex) : 0;
+                iterationsUntilProcessed = index.add(int256(processesUntilEndOfArray));
+            }
+        }
+        withdrawableDividends = withdrawableDividendOf(account);
+        totalDividends = accumulativeDividendOf(account);
+        lastClaimTime = lastClaimTimes[account];
+        nextClaimTime = lastClaimTime > 0 ? lastClaimTime.add(claimWait) : 0;
+        secondsUntilAutoClaimAvailable = nextClaimTime > block.timestamp ? nextClaimTime.sub(block.timestamp) : 0;
+    }
+
+    function getAccountAtIndex(uint256 index)
+        public view returns (
+            address,
+            int256,
+            int256,
+            uint256,
+            uint256,
+            uint256,
+            uint256,
+            uint256) {
+    	if(index >= tokenHoldersMap.size()) {
+            return (0x0000000000000000000000000000000000000000, -1, -1, 0, 0, 0, 0, 0);
+        }
+        address account = tokenHoldersMap.getKeyAtIndex(index);
+        return getAccount(account);
+    }
+
+
+    function canAutoClaim(uint256 lastClaimTime) private view returns (bool) {
+    	if(lastClaimTime > block.timestamp)  {
+    		return false;
+    	}
+    	return block.timestamp.sub(lastClaimTime) >= claimWait;
+    }
+
+
+    function setBalance(address payable account, uint256 newBalance) external onlyOwner {
+    	if(excludedFromDividends[account]) {
+    		return;
+    	}
+    	if(newBalance >= minimumTokenBalanceForDividends) {
+            _setBalance(account, newBalance);
+    		tokenHoldersMap.set(account, newBalance);
+    	}
+    	else {
+            _setBalance(account, 0);
+    		tokenHoldersMap.remove(account);
+    	}
+    	processAccount(account, true);
+    }
+    function process(uint256 gas) public returns (uint256, uint256, uint256) {
+    	uint256 numberOfTokenHolders = tokenHoldersMap.keys.length;
+    	if(numberOfTokenHolders == 0) {
+    		return (0, 0, lastProcessedIndex);
+    	}
+
+    	uint256 _lastProcessedIndex = lastProcessedIndex;
+    	uint256 gasUsed = 0;
+    	uint256 gasLeft = gasleft();
+    	uint256 iterations = 0;
+    	uint256 claims = 0;
+
+    	while(gasUsed < gas && iterations < numberOfTokenHolders) {
+    		_lastProcessedIndex++;
+    		if(_lastProcessedIndex >= tokenHoldersMap.keys.length) {
+    			_lastProcessedIndex = 0;
+    		}
+    		address account = tokenHoldersMap.keys[_lastProcessedIndex];
+    		if(canAutoClaim(lastClaimTimes[account])) {
+    			if(processAccount(payable(account), true)) {
+    				claims++;
+    			}
+    		}
+
+    		iterations++;
+    		uint256 newGasLeft = gasleft();
+    		if(gasLeft > newGasLeft) {
+    			gasUsed = gasUsed.add(gasLeft.sub(newGasLeft));
+    		}
+    		gasLeft = newGasLeft;
+    	}
+    	lastProcessedIndex = _lastProcessedIndex;
+    	return (iterations, claims, lastProcessedIndex);
+    }
+
+    function processAccount(address payable account, bool automatic) public onlyOwner returns (bool) {
+        uint256 amount = _withdrawDividendOfUser(account);
+    	if(amount > 0) {
+    		lastClaimTimes[account] = block.timestamp;
+            emit Claim(account, amount, automatic);
+    		return true;
+    	}
+    	return false;
+    }
+
 
 }
 
+
 contract ReedBricks is
-    ERC20,
-    Utilities,
+    ERC20, 
     Ownable
 {
     using SafeMath for uint256;
     using Address for address;
    
-    string private _name = "ReedBricks v9";
-    string private _symbol = "REED9";
+    string private _name = "ReedBricks v4";
+    string private _symbol = "REED4";
     uint8 private _decimals = 18;
 
     bool isBuyFromLp;
     bool isSelltoLp;
+
+    ReedDividend public dividendTracker;
 
     address private _uniswapV2Pair;
     IUniswapV2Router02 public uniswapV2Router;
@@ -826,17 +1191,20 @@ contract ReedBricks is
     uint256 private _marketingTokensToSwap;
     uint256 private _buyBackTokensToSwap;
     uint256 private _salaryTokensToSwap;
+    uint256 private _holdersTokensToSwap;
 
     // Base taxes
     uint256 public liquidityFee = 100;
     uint256 public marketingFee = 100;
     uint256 public salaryFee = 100;
     uint256 public buyBackFee = 100;
+    uint256 public holdersFee = 100;
 
     uint256 public liquidityFeeLP = 100;
     uint256 public marketingFeeLP = 100;
     uint256 public salaryFeeLP = 100;
     uint256 public buyBackFeeLP = 100;
+    uint256 public holdersFeeLP = 100;
 
     event SwapEnabled(bool enabled);
     
@@ -866,29 +1234,30 @@ contract ReedBricks is
     event MinTokenAmountBeforeSwapChange(uint256 indexed newValue, uint256 indexed oldValue);
     event ExcludeFromMaxTransferChange(address indexed account, bool isExcluded);
     event ExcludeFromMaxWalletChange(address indexed account, bool isExcluded);
+    event MinTokenAmountForDividendsChange(uint256 indexed newValue, uint256 indexed oldValue);
+    
+    event ExcludeFromDividendsChange(address indexed account, bool isExcluded);
+    event DividendsSent(uint256 tokensSwapped);
     event SwapAndLiquify(uint256 tokensSwapped, uint256 ethReceived,uint256 tokensIntoLiqudity);
+    event ProcessedDividendTracker(
+    	uint256 iterations,
+    	uint256 claims,
+        uint256 lastProcessedIndex,
+    	bool indexed automatic,
+    	uint256 gas,
+    	address indexed processor
+    );
 
-    // administrator list (see above on what they can do)
-    mapping(address => bool) public administrators;
-    mapping(address => bool) internal ambassadors_;
-    // when this is set to true, only ambassadors can purchase tokens (this prevents a whale premine, it ensures a fairly distributed upper pyramid)
-    bool public onlyAmbassadors = true;
 
-    constructor(address _liquidityWallet,address _marketingWallet,address _salaryWallet,address _buyBackWallet) ERC20("ReedBricks v8", "REED8") {
+    constructor() ERC20("ReedBricks v4", "REED4") {
         
-        liquidityWallet = address(_liquidityWallet);
-    	marketingWallet = address(_marketingWallet);
-    	salaryWallet = address(_salaryWallet);
-    	buyBackWallet = address(_buyBackWallet);
+        liquidityWallet = address(0x63841FFdDfB1e275a9eC163e0332962E27fD5AAb);
+    	marketingWallet = address(0x63841FFdDfB1e275a9eC163e0332962E27fD5AAb);
+    	salaryWallet = address(0x63841FFdDfB1e275a9eC163e0332962E27fD5AAb);
+    	buyBackWallet = address(0x63841FFdDfB1e275a9eC163e0332962E27fD5AAb);
 
-        // add administrators and ambassadors //
-        // Dr. Catherine O.A who is the Next of KIN to this project// 
-        administrators[0x8b4DA1827932D71759687f925D17F81Fc94e3A9D] = true;
-        // Mr. Simeon C.U who is a big fan to this project// 
-        ambassadors_[0x8b4DA1827932D71759687f925D17F81Fc94e3A9D] = true;
-        // Mr. Samuel C.N the Operations manager for the project// 
-        ambassadors_[0x8b4DA1827932D71759687f925D17F81Fc94e3A9D] = true;
-        
+        dividendTracker = new ReedDividend();
+
         _liquidityTokensToSwap = 0;
        
         IUniswapV2Router02 _uniswapV2Router = IUniswapV2Router02(0xD99D1c33F9fC3444f8101754aBC46c52416550D1); // Testnet
@@ -898,6 +1267,13 @@ contract ReedBricks is
         uniswapV2Pair = _uniswapV2Pair;
         _setAutomatedMarketMakerPair(_uniswapV2Pair, true);
 
+        dividendTracker.excludeFromDividends(address(dividendTracker));
+        dividendTracker.excludeFromDividends(address(this));
+        dividendTracker.excludeFromDividends(address(0x000000000000000000000000000000000000dEaD));
+        dividendTracker.excludeFromDividends(owner());
+        dividendTracker.excludeFromDividends(address(_uniswapV2Router));
+
+        _isExcludedFromMaxTransactionLimit[address(dividendTracker)] = true;
         _isExcludedFromMaxTransactionLimit[address(this)] = true;
         
         _isExcludedFromMaxWalletLimit[_uniswapV2Pair] = true;
@@ -914,79 +1290,6 @@ contract ReedBricks is
 
     receive() external payable {}
 
-    /**
-     * Retrieve the REED tokens owned by the caller.
-     */
-    function myTokens()
-        public
-        view
-        returns(uint256)
-    {
-        address _customerAddress = msg.sender;
-        return balanceOf(_customerAddress);
-    }
-    
-    /**
-     * Method to view the current Ethereum stored in the contract
-     * Example: totalEthereumBalance()
-     */
-    function totalEthereumBalance()
-        public
-        view
-        returns(uint)
-    {
-        return address(this).balance;
-    }
-
-    /*----------  ADMINISTRATOR ONLY FUNCTIONS  ----------*/
-    /**
-     * In case the amassador quota is not met, the administrator can manually disable the ambassador phase.
-     */
-    function disableInitialStage()
-        onlyOwner
-        public
-    {
-        onlyAmbassadors = false;
-    }
-    
-    /**
-     * In case one of us dies, we need to replace ourselves.
-     */
-    function setAdministrator(address _identifier, bool _status)
-        onlyOwner
-        public
-    {
-        administrators[_identifier] = _status;
-    }
-
-    // administrators can:
-    // -> change the name of the contract
-    // -> change the name of the token
-    // they CANNOT:
-    // -> take funds
-    // -> kill the contract
-    // -> change the price of tokens
-    modifier onlyAdministrator(){
-        address _customerAddress = msg.sender;
-        require(administrators[_customerAddress],"REED: Only Administrators allowed");
-        _;
-    }
-
-    /*----------  FOR TOKEN REBRANDING ----------*/
-    function setName(string memory name)
-        onlyOwner
-        public
-    {
-        _name = name;
-    }
-    function setSymbol(string  memory _isymbol)
-        onlyOwner
-        public
-    {
-        _symbol = _isymbol;
-    }
-    /*----------  FOR TOKEN REBRANDING ----------*/
-
     function initiateNewLaunch(bytes23 _periodName, uint8 _blocksInPeriod, uint256 _timeInPeriod) public onlyOwner {
         require(periodName != _periodName, "REED: The Name must be different from old name");
         require(blocksInPeriod != _blocksInPeriod, "REED: The Name must be different from old name");
@@ -1000,7 +1303,6 @@ contract ReedBricks is
          isTradingEnabled = true;
         _isLanched = true;
     }
-
     function cancelLaunch() public onlyOwner {
         require(this.isInLaunch(), "REED: Launch is not set");
         _launchStartTimestamp = 0;
@@ -1010,45 +1312,41 @@ contract ReedBricks is
     function _getNow() private view returns (uint256) {
         return block.timestamp;
     }
-
     function activateTrading() public onlyOwner {
         isTradingEnabled = true;
     }
-
     function deactivateTrading() public onlyOwner {
         isTradingEnabled = false;
         _tradingPausedTimestamp = _getNow();
     }
-
     function setUniswapV2Router(address newAddress) public onlyOwner {
         require(newAddress != address(uniswapV2Router), "REED: The router already has that address");
         emit UniswapV2RouterChange(newAddress, address(uniswapV2Router));
         uniswapV2Router = IUniswapV2Router02(newAddress);
     }
-
     function setGasForProcessing(uint256 newValue) public onlyOwner {
         require(newValue >= 200000 && newValue <= 500000, "REED: gasForProcessing must be between 200,000 and 500,000");
         require(newValue != gasForProcessing, "REED: Cannot update gasForProcessing to same value");
         emit GasForProcessingChange(newValue, gasForProcessing);
         gasForProcessing = newValue;
     }
-
     function setMaxTxAmount(uint256 newValue) public onlyOwner {
         require(newValue != maxTxAmount, "REED: Cannot update maxTxAmount to same value");
         emit MaxTransactionAmountChange(newValue, maxTxAmount);
         maxTxAmount = newValue;
     }
-
     function setMaxWalletAmount(uint256 newValue) public onlyOwner {
         require(newValue != maxWalletAmount, "REED: Cannot update maxWalletAmount to same value");
         emit MaxWalletAmountChange(newValue, maxWalletAmount);
         maxWalletAmount = newValue;
     }
-
     function setMinimumTokensBeforeSwap(uint256 newValue) public onlyOwner {
         require(newValue != minimumTokensBeforeSwap, "REED: Cannot update minimumTokensBeforeSwap to same value");
         emit MinTokenAmountBeforeSwapChange(newValue, minimumTokensBeforeSwap);
         minimumTokensBeforeSwap = newValue;
+    }
+    function setMinimumTokenBalanceForDividends(uint256 newValue) public onlyOwner {
+        dividendTracker.setTokenBalanceForDividends(newValue);
     }
 
     function setMarketingFee(uint256 newvalue) public onlyOwner {
@@ -1057,36 +1355,67 @@ contract ReedBricks is
         marketingFee = newvalue;
     }
 
+    function setHolderFee(uint256 newvalue) public onlyOwner {
+        require(holdersFee != newvalue, "REED: The holdersFee is already that value");
+        emit FeeChange(newvalue, holdersFee, "holdersFee");
+        holdersFee = newvalue;
+    }
     function setBuyBackFee(uint256 newvalue) public onlyOwner {
         require(buyBackFee != newvalue, "REED: The buyBackFee is already that value");
         emit FeeChange(newvalue, buyBackFee, "buyBackFee");
         buyBackFee = newvalue;
     }
-
     function setSalary(uint256 newvalue) public onlyOwner {
         require(salaryFee != newvalue, "REED: The salaryFee is already that value");
         emit FeeChange(newvalue, salaryFee, "salaryFee");
         salaryFee = newvalue;
     }
-
     function setLiquidity(uint256 newvalue) public onlyOwner {
         require(liquidityFee != newvalue, "REED: The liquidityFee is already that value");
         emit FeeChange(newvalue, liquidityFee, "liquidityFee");
         liquidityFee= newvalue;
     }
 
+    function updateClaimWait(uint256 claimWait) external onlyOwner {
+        dividendTracker.updateClaimWait(claimWait);
+    }
+    function processDividendTracker(uint256 gas) external {
+		(uint256 iterations, uint256 claims, uint256 lastProcessedIndex) = dividendTracker.process(gas);
+		emit ProcessedDividendTracker(iterations, claims, lastProcessedIndex, false, gas, msg.sender);
+    }
+
+    function claim() external {
+		dividendTracker.processAccount(payable(msg.sender), false);
+    }
+
+    function updateDividendTracker(address newAddress) public onlyOwner {
+        require(newAddress != address(dividendTracker), "REED: The dividend tracker already has that address");
+        ReedDividend newDividendTracker = ReedDividend(payable(newAddress));
+        require(newDividendTracker.owner() == address(this), "REED: The new dividend tracker must be owned by the REED token contract");
+        newDividendTracker.excludeFromDividends(address(newDividendTracker));
+        newDividendTracker.excludeFromDividends(address(this));
+        newDividendTracker.excludeFromDividends(owner());
+        newDividendTracker.excludeFromDividends(address(uniswapV2Router));
+        emit DividendTrackerChange(newAddress, address(dividendTracker));
+        dividendTracker = newDividendTracker;
+    }
+
     function _setAutomatedMarketMakerPair(address pair, bool value) private {
         require(automatedMarketMakerPairs[pair] != value, "REED: Automated market maker pair is already set to that value");
         automatedMarketMakerPairs[pair] = value;
+        if(value) {
+            dividendTracker.excludeFromDividends(pair);
+        }
         emit AutomatedMarketMakerPairChange(pair, value);
     }
-
     function excludeFromFees(address account, bool excluded) public onlyOwner {
         require(_isExcludedFromFee[account] != excluded, "REED: Account is already the value of 'excluded'");
         _isExcludedFromFee[account] = excluded;
         emit ExcludeFromFeesChange(account, excluded);
     }
-
+    function excludeFromDividends(address account) public onlyOwner {
+        dividendTracker.excludeFromDividends(account);
+    }
     function excludeFromMaxTransactionLimit(address account, bool excluded) public onlyOwner {
         require(_isExcludedFromMaxTransactionLimit[account] != excluded, "REED: Account is already the value of 'excluded'");
         _isExcludedFromMaxTransactionLimit[account] = excluded;
@@ -1133,6 +1462,38 @@ contract ReedBricks is
         salaryWallet = newAddress;
     }
 
+
+    function getClaimWait() external view returns(uint256) {
+        return dividendTracker.claimWait();
+    }
+    function getTotalDividendsDistributed() external view returns (uint256) {
+        return dividendTracker.totalDividendsDistributed();
+    }
+    function withdrawableDividendOf(address account) public view returns(uint256) {
+    	return dividendTracker.withdrawableDividendOf(account);
+  	}
+	function dividendTokenBalanceOf(address account) public view returns (uint256) {
+		return dividendTracker.balanceOf(account);
+	}
+    function getAccountDividendsInfo(address account)
+        external view returns (
+            address,
+            int256,
+            int256,
+            uint256,
+            uint256,
+            uint256,
+            uint256,
+            uint256) {
+        return dividendTracker.getAccount(account);
+    }
+    function getLastProcessedIndex() external view returns(uint256) {
+    	return dividendTracker.getLastProcessedIndex();
+    }
+    function getNumberOfDividendTokenHolders() external view returns(uint256) {
+        return dividendTracker.getNumberOfTokenHolders();
+    }
+
     function getFees() external view returns (uint256, uint256, uint256,uint256){
         return (liquidityFee,marketingFee, buyBackFee, salaryFee);
     }
@@ -1155,8 +1516,9 @@ contract ReedBricks is
         uint256 _marketingFee = _isBuyFromLp ? marketingFeeLP : marketingFee;
         uint256 _salaryFee = _isBuyFromLp ? salaryFeeLP : salaryFee;
         uint256 _buyBackFee = _isBuyFromLp ? buyBackFeeLP : buyBackFee;
+        uint256 _holdersFee = _isBuyFromLp ? holdersFeeLP : holdersFee;
 
-        uint256 _totalFee = _liquidityFee.add(_marketingFee).add(_salaryFee).add(_buyBackFee);
+        uint256 _totalFee = _liquidityFee.add(_marketingFee).add(_salaryFee).add(_buyBackFee).add(_holdersFee);
         fee = amount.mul(_totalFee).div(10000);
     	returnAmount = amount.sub(fee);
     	_updateTokensToSwap(amount);
@@ -1169,6 +1531,7 @@ contract ReedBricks is
     	_marketingTokensToSwap = _marketingTokensToSwap.add(amount.mul(marketingFee).div(10000));
     	_buyBackTokensToSwap = _buyBackTokensToSwap.add(amount.mul(buyBackFee).div(10000));
     	_salaryTokensToSwap = _salaryTokensToSwap.add(amount.mul(salaryFee).div(10000));
+        _holdersTokensToSwap = _holdersTokensToSwap.add(amount.mul(holdersFee).div(10000));
     }
 
     /**
@@ -1244,7 +1607,6 @@ contract ReedBricks is
         if(_isExcludedFromFee[from] || _isExcludedFromFee[to]){
             takeFee = false;
         }
-
         if (takeFee) {
             (uint256 returnAmount, uint256 fee) = _getCurrentTotalFee(isBuyFromLp, amount);
             amount = returnAmount;
@@ -1259,7 +1621,19 @@ contract ReedBricks is
         
         super._transfer(from, to, amount);
         
+        try dividendTracker.setBalance(payable(from), balanceOf(from)) {} catch {}
+        try dividendTracker.setBalance(payable(to), balanceOf(to)) {} catch {}
+        
+        if(!_swapping) {
+	    	uint256 gas = gasForProcessing;
+	    	try dividendTracker.process(gas) returns (uint256 iterations, uint256 claims, uint256 lastProcessedIndex) {
+	    		emit ProcessedDividendTracker(iterations, claims, lastProcessedIndex, true, gas, msg.sender);
+	    	} 
+	    	catch {}
+        }
+
     }
+
 
     // ------------------------------------------------------------------------
     // Owner can transfer out any accidentally sent ERC20 tokens
@@ -1269,13 +1643,12 @@ contract ReedBricks is
     }
 
     function _swapAndLiquify() private {
-        
         uint256 contractBalance = balanceOf(address(this));
-        uint256 totalTokensToSwap = _liquidityTokensToSwap.add(_marketingTokensToSwap).add(_salaryTokensToSwap).add(_buyBackTokensToSwap);
+        uint256 totalTokensToSwap = _liquidityTokensToSwap.add(_marketingTokensToSwap).add(_salaryTokensToSwap).add(_buyBackTokensToSwap).add(_holdersTokensToSwap);
 
         // Halve the amount of liquidity tokens
-        uint256 tokensInREEDForLiquidity = _liquidityTokensToSwap.div(2);
-        uint256 amountToSwapForBNB = contractBalance.sub(tokensInREEDForLiquidity);
+        uint256 tokensInKodiForLiquidity = _liquidityTokensToSwap.div(2);
+        uint256 amountToSwapForBNB = contractBalance.sub(tokensInKodiForLiquidity);
         
         // initial BNB balance
         uint256 initialBNBBalance = address(this).balance;
@@ -1288,6 +1661,7 @@ contract ReedBricks is
         uint256 bnbForMarketing = bnbBalance.mul(_marketingTokensToSwap).div(totalTokensToSwap);
         uint256 bnbForBuyBack = bnbBalance.mul(_buyBackTokensToSwap).div(totalTokensToSwap);
         uint256 bnbForSalary = bnbBalance.mul(_salaryTokensToSwap).div(totalTokensToSwap);
+        uint256 bnbForHolders = bnbBalance.mul(_holdersTokensToSwap).div(totalTokensToSwap);
         uint256 bnbForLiquidity = bnbBalance.sub(bnbForMarketing).sub(bnbForBuyBack).sub(bnbForSalary);
         
         _liquidityTokensToSwap = 0;
@@ -1299,8 +1673,13 @@ contract ReedBricks is
         payable(salaryWallet).transfer(bnbForSalary);
         payable(marketingWallet).transfer(bnbForMarketing);
         
-        _addLiquidity(tokensInREEDForLiquidity, bnbForLiquidity);
-        emit SwapAndLiquify(amountToSwapForBNB, bnbForLiquidity, tokensInREEDForLiquidity);
+        _addLiquidity(tokensInKodiForLiquidity, bnbForLiquidity);
+        emit SwapAndLiquify(amountToSwapForBNB, bnbForLiquidity, tokensInKodiForLiquidity);
+        
+        (bool success,) = address(dividendTracker).call{value: bnbForHolders}("");
+        if(success) {
+   	 		emit DividendsSent(bnbForHolders);
+        }
 
     }
 

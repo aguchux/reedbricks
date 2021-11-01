@@ -14,7 +14,7 @@ pragma solidity 0.8.9;
 contract Context {
   // Empty internal constructor, to prevent people from mistakenly deploying
   // an instance of this contract, which should be used via inheritance.
-  constructor () { }
+  constructor () {}
 
   function _msgSender() internal view returns (address) {
     return msg.sender;
